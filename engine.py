@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 from datetime import datetime
+
 from models.report import FishingReport
 
 # Constants
@@ -48,65 +49,86 @@ def get_coords_by_zip(zip_code: str) -> dict:
 
 def get_fishing_data(lat: float, lon: float) -> FishingReport:
     """
-    Acts as the 'Service' method. Fetches from multiple APIs, 
-    processes the business logic (Bite Score), and returns a 
-    clean Data Object (Bean).
+    Acts as the service method. Fetches from multiple APIs,
+    processes bite score, and returns a clean data object.
     """
-    
     # URLs
     w_url = (f"https://api.open-meteo.com/v1/forecast?"
-             f"latitude={lat}&longitude={lon}"
-             f"&current=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,precipitation,cloud_cover"
-             f"&hourly=surface_pressure&daily=sunrise,sunset"
-             f"&past_days=3&forecast_days=2&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FChicago")
-    
+              f"latitude={lat}&longitude={lon}"
+              f"&current=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,precipitation,cloud_cover"
+              f"&hourly=surface_pressure&daily=sunrise,sunset"
+              f"&past_days=7&forecast_days=1&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FChicago")
     r_url = f"https://waterservices.usgs.gov/nwis/iv/?format=json&sites={RIVER_STATION}&parameterCd=00065"
-
+    
     # 1. Network Requests
-    w_res = requests.get(w_url).json()
-    r_res = requests.get(r_url).json()
-
+    try:
+        w_res = requests.get(w_url).json()
+        r_res = requests.get(r_url).json()
+    except requests.RequestException as e:
+        st.error(f"Error fetching data: {e}")
+        return None
+    
     # 2. Data Transformation (The 'Meat' of the engine)
-    cur = w_res['current']
+    cur = w_res.get('current', {})
     
     # Pressure Logic
-    p_now = round(cur['surface_pressure'] * 0.02953, 2)
-    p_past = round(w_res['hourly']['surface_pressure'][-6] * 0.02953, 2)
-    trend = round(p_now - p_past, 3)
+    p_now = round(cur.get('surface_pressure', 0) * 0.02953, 2) if 'surface_pressure' in cur else 0
+    p_past = round(w_res.get('hourly', {}).get('surface_pressure', [0])[-6] * 0.02953, 2) if 'hourly' in w_res else 0
+    trend = round(p_now - p_past, 3) if 'surface_pressure' in cur else 0
     
     # River Logic
     try:
         river_val = r_res['value']['timeSeries'][0]['values'][0]['value'][0]['value']
     except (KeyError, IndexError):
         river_val = "Unavailable"
-
+    
     # Bite Score Logic (Business Rules)
-    score = 50 
+    score = 50
     if trend < -0.01: score += 30
     elif trend > 0.01: score -= 20
-    if cur['wind_speed_10m'] < 10: score += 10
-    if cur['cloud_cover'] > 50: score += 10
+    if cur.get('wind_speed_10m', 0) < 10: score += 10
+    if cur.get('cloud_cover', 0) > 50: score += 10
     score = max(0, min(100, score))
+    
+    # 6-Hour Pressure Trend DataFrame (past 7 days, up to now)
+    raw_times = w_res.get('hourly', {}).get('time', [])
+    raw_pressures = w_res.get('hourly', {}).get('surface_pressure', [])
+    now = datetime.now()
 
-    # Hourly Trend DataFrame
-    df = pd.DataFrame({
-        'Time': pd.to_datetime(w_res['hourly']['time']),
-        'inHg': [p * 0.02953 for p in w_res['hourly']['surface_pressure']]
+    filtered_times = []
+    filtered_pressures = []
+    for t, p in zip(raw_times, raw_pressures):
+        if not t or p is None:
+            continue
+        dt = datetime.strptime(t, "%Y-%m-%dT%H:%M")
+        if dt > now:
+            break
+        if dt.hour in (0, 6, 12, 18):
+            filtered_times.append(dt.strftime("%-m/%-d %-I%p").lower())
+            filtered_pressures.append(round(p * 0.02953, 2))
+
+    hourly_df = pd.DataFrame({
+        'Time': filtered_times,
+        'inHg': filtered_pressures
     })
-
+    
+    # Sunrise and Sunset
+    sunrise = w_res.get('daily', {}).get('sunrise', ['N/A'])[3].split('T')[1] if 'daily' in w_res else 'N/A'
+    sunset = w_res.get('daily', {}).get('sunset', ['N/A'])[3].split('T')[1] if 'daily' in w_res else 'N/A'
+    
     # 3. Instantiate and Return the FishingReport 'Bean'
     return FishingReport(
-        temperature=cur['temperature_2m'],
+        temperature=cur.get('temperature_2m', 0),
         pressure_inhg=p_now,
         trend=trend,
-        wind_speed=cur['wind_speed_10m'],
-        wind_dir=_get_cardinal(cur['wind_direction_10m']),
+        wind_speed=cur.get('wind_speed_10m', 0),
+        wind_dir=_get_cardinal(cur.get('wind_direction_10m', 0)),
         river_stage=river_val,
         bite_score=score,
-        hourly_df=df,
-        sunrise=w_res['daily']['sunrise'][3].split('T')[1],
-        sunset=w_res['daily']['sunset'][3].split('T')[1],
+        hourly_df=hourly_df,
+        sunrise=sunrise,
+        sunset=sunset,
         moon_phase=_calculate_moon(datetime.now()),
-        cloud_cover=cur['cloud_cover'],
-        precip=cur['precipitation']
+        cloud_cover=cur.get('cloud_cover', 0),
+        precip=cur.get('precipitation', 0)
     )
